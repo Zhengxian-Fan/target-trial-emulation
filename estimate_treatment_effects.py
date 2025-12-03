@@ -21,7 +21,7 @@ np.random.seed(1234)
 # =============================================================================
 
 DATA_PATHS = {
-    "imputed_data_dir": "./imputed_data/",
+    "imputed_data_dir": "./synthetic_data/", # Updated to point to your synthetic folder
     "output_dir": "./results/"
 }
 
@@ -29,7 +29,7 @@ STUDY_PARAMS = {
     "treatment": "treatment",
     "outcome": "all_cause_mortality_2y",
     "caliper": 0.01,
-    "trimming_thresholds": np.round(np.arange(0.01, 0.11, 0.01), 2), # Matching your notebook range
+    "trimming_thresholds": np.round(np.arange(0.01, 0.11, 0.01), 2),
     "n_folds": 5
 }
 
@@ -58,6 +58,12 @@ class RubinsRules:
         m = len(estimates)
         if m == 0: return np.nan, np.nan, np.nan
         
+        # Handle case with only 1 dataset
+        if m == 1:
+            est = estimates[0]
+            se = std_errors[0]
+            return np.exp(est), np.exp(est - 1.96 * se), np.exp(est + 1.96 * se)
+
         pooled_est = np.mean(estimates)
         within_var = np.mean(np.array(std_errors)**2)
         between_var = np.var(estimates, ddof=1)
@@ -70,14 +76,10 @@ class RubinsRules:
         return np.exp(pooled_est), np.exp(lower_ci), np.exp(upper_ci)
 
 # =============================================================================
-# 3. CV-TMLE LOGIC (Matches your CV_TMLE.py)
+# 3. CV-TMLE LOGIC
 # =============================================================================
 
 class CVTMLE_Sturmer:
-    """
-    Implements the targeting step of TMLE on Cross-Validated predictions.
-    Logic mirrored from CVTMLE_PERCENTILE class.
-    """
     def __init__(self, q_t0, q_t1, g, t, y, truncate_level=0.05):
         self.q_t0 = q_t0
         self.q_t1 = q_t1
@@ -87,17 +89,12 @@ class CVTMLE_Sturmer:
         self.truncate_level = truncate_level
 
     def _trim_data(self, q_t0, q_t1, g, t, y, level):
-        """
-        Applies Stürmer trimming based on group-specific quantiles of g.
-        """
         treated_mask = (t == 1)
         untreated_mask = (t == 0)
         
-        # Calculate thresholds
         lb_treated = np.quantile(g[treated_mask], level) if np.sum(treated_mask) > 0 else 0.0
         ub_untreated = np.quantile(g[untreated_mask], 1 - level) if np.sum(untreated_mask) > 0 else 1.0
             
-        # Create mask
         keep_mask = np.zeros_like(g, dtype=bool)
         keep_mask[treated_mask] = g[treated_mask] >= lb_treated
         keep_mask[untreated_mask] = g[untreated_mask] <= ub_untreated
@@ -105,44 +102,31 @@ class CVTMLE_Sturmer:
         return q_t0[keep_mask], q_t1[keep_mask], g[keep_mask], t[keep_mask], y[keep_mask]
 
     def _perturbed_model(self, q_t0, q_t1, g, t, eps):
-        # Clever covariate H
         g_clipped = np.clip(g, 1e-6, 1 - 1e-6)
         h = t * (1. / g_clipped) - (1. - t) / (1. - g_clipped)
-        
-        # Offset
         q_t0_c = np.clip(q_t0, 1e-8, 1-1e-8)
         q_t1_c = np.clip(q_t1, 1e-8, 1-1e-8)
         full_log_q = (1. - t) * logit(q_t0_c) + t * logit(q_t1_c)
-        
         return expit(full_log_q + eps * h)
 
-    def fit_rr(self, n_bootstrap=500):
-        # 1. Apply Trimming
+    def fit_rr(self, n_bootstrap=200):
         q0, q1, g_trim, t_trim, y_trim = self._trim_data(self.q_t0, self.q_t1, self.g, self.t, self.y, self.truncate_level)
         if len(t_trim) < 10: return np.nan, np.nan
 
-        # 2. Define Minimization Routine (matches your fit_rr)
         def solve_eps(curr_q0, curr_q1, curr_g, curr_t, curr_y):
             def loss_fn(eps):
                 p_pert = self._perturbed_model(curr_q0, curr_q1, curr_g, curr_t, eps)
-                # Minimize Negative Log-Likelihood
                 return -np.mean(curr_y * np.log(p_pert + 1e-9) + (1 - curr_y) * np.log(1 - p_pert + 1e-9))
             
-            # Find epsilon
             eps_hat = minimize(loss_fn, 0.0, method="Nelder-Mead").x.item()
-            
-            # Update Q
             qq1 = self._perturbed_model(curr_q0, curr_q1, curr_g, np.ones_like(curr_t), eps_hat)
             qq0 = self._perturbed_model(curr_q0, curr_q1, curr_g, np.zeros_like(curr_t), eps_hat)
             return np.mean(qq1) / np.mean(qq0)
 
-        # 3. Point Estimate
         rr_point = solve_eps(q0, q1, g_trim, t_trim, y_trim)
 
-        # 4. Bootstrap for SE
         n = len(t_trim)
         seeds = np.arange(n_bootstrap) + 12345
-        
         def bootstrap_step(seed):
             rng = np.random.default_rng(seed)
             idx = rng.integers(0, n, size=n)
@@ -153,14 +137,13 @@ class CVTMLE_Sturmer:
         
         if len(results) < (n_bootstrap * 0.5): return rr_point, np.nan
         
-        # Return Log Scale SE for Rubin's Rules
         log_results = np.log(results)
         se_log_rr = np.std(log_results, ddof=1)
         
         return rr_point, se_log_rr
 
 # =============================================================================
-# 4. DATA PROCESSING
+# 4. PROCESSING FUNCTIONS
 # =============================================================================
 
 def load_and_preprocess(file_path, treatment_col, outcome_col):
@@ -171,9 +154,11 @@ def load_and_preprocess(file_path, treatment_col, outcome_col):
     
     df = pd.read_parquet(file_path, columns=list(set(cols)))
     
+    # Dates
     for col in COVARIATES_CONFIG["dates"] + ["trial_start"]:
         if col in df.columns: df[col] = pd.to_datetime(df[col], errors='coerce')
         
+    # Calculate Time-to-Event
     df['event_date'] = df['dod']
     df['end_followup'] = df[['end_followup_date_2y', 'enddate', 'event_date']].min(axis=1)
     df['time_to_event'] = (df['end_followup'] - df['trial_start']).dt.days
@@ -182,15 +167,20 @@ def load_and_preprocess(file_path, treatment_col, outcome_col):
     df[treatment_col] = pd.to_numeric(df[treatment_col], errors='coerce')
     df[outcome_col] = pd.to_numeric(df[outcome_col], errors='coerce').fillna(0)
 
+    # One-Hot Encoding
     cat_vars = [c for c in COVARIATES_CONFIG["categorical"] if c in df.columns]
     for c in cat_vars: df[c] = df[c].astype(str)
     df = pd.get_dummies(df, columns=cat_vars, drop_first=True, dummy_na=False)
     
+    # CRITICAL FIX: Drop raw date columns (containing NaTs for survivors) 
+    # BEFORE calling dropna() to preserve survivors.
+    cols_to_drop = COVARIATES_CONFIG["dates"] + ["trial_start", "event_date", "end_followup"]
+    df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
+    
     return df.dropna()
 
 def get_covariates(df, treatment_col, outcome_col):
-    exclude = [treatment_col, outcome_col, 'patid', 'trial_start', 'dod', 'enddate', 
-               'end_followup_date_2y', 'event_date', 'end_followup', 'time_to_event']
+    exclude = [treatment_col, outcome_col, 'patid', 'time_to_event']
     return [c for c in df.columns if c not in exclude]
 
 # =============================================================================
@@ -198,7 +188,6 @@ def get_covariates(df, treatment_col, outcome_col):
 # =============================================================================
 
 def run_psm(df, treatment_col, outcome_col, feats, caliper):
-    # Scale Features
     X = StandardScaler().fit_transform(df[feats])
     ps_model = LogisticRegression(max_iter=2000, solver='lbfgs').fit(X, df[treatment_col])
     df['propensity_score'] = ps_model.predict_proba(X)[:, 1]
@@ -239,50 +228,37 @@ def run_iptw(df, treatment_col, outcome_col, feats, thresholds):
     return results
 
 def run_cv_tmle(df, treatment_col, outcome_col, feats, thresholds, n_folds=5):
-    """
-    Runs 5-Fold CV-TMLE generating predictions using 'T-Learner' approach 
-    (Separate outcome models for T=0 and T=1).
-    """
     y = df[outcome_col].values
     t = df[treatment_col].values
     X = df[feats].values
     
-    # Initialize arrays for cross-validated predictions (stacked)
     n = len(df)
-    g_cv = np.zeros(n)
-    q0_cv = np.zeros(n)
-    q1_cv = np.zeros(n)
+    g_cv, q0_cv, q1_cv = np.zeros(n), np.zeros(n), np.zeros(n)
     
     skf = StratifiedKFold(n_splits=n_folds, shuffle=True, random_state=1234)
     
-    # Cross-Validation Loop
     for train_idx, test_idx in skf.split(X, t):
         X_train, X_test = X[train_idx], X[test_idx]
         t_train, _      = t[train_idx], t[test_idx]
         y_train, _      = y[train_idx], y[test_idx]
         
-        # Scale (fit on train, transform test)
         scaler = StandardScaler().fit(X_train)
         X_train_s = scaler.transform(X_train)
         X_test_s = scaler.transform(X_test)
         
-        # 1. Fit Propensity Score (g)
         g_model = LogisticRegression(max_iter=1000, solver='lbfgs').fit(X_train_s, t_train)
         g_cv[test_idx] = g_model.predict_proba(X_test_s)[:, 1]
         
-        # 2. Fit Outcome Model T=0 (on control subset of training)
         mask_t0 = (t_train == 0)
         q0_model = LogisticRegression(max_iter=1000, solver='lbfgs')
         q0_model.fit(X_train_s[mask_t0], y_train[mask_t0])
         q0_cv[test_idx] = q0_model.predict_proba(X_test_s)[:, 1]
         
-        # 3. Fit Outcome Model T=1 (on treated subset of training)
         mask_t1 = (t_train == 1)
         q1_model = LogisticRegression(max_iter=1000, solver='lbfgs')
         q1_model.fit(X_train_s[mask_t1], y_train[mask_t1])
         q1_cv[test_idx] = q1_model.predict_proba(X_test_s)[:, 1]
 
-    # Run Targeting Step on Full Stacked Predictions
     results = []
     for trim in thresholds:
         tmle = CVTMLE_Sturmer(q0_cv, q1_cv, g_cv, t, y, truncate_level=trim)
@@ -333,9 +309,14 @@ def main():
 
     print("\n--- POOLED RESULTS (Rubin's Rules) ---")
     
-    hr, lb, ub = RubinsRules.pool_estimates(psm_estimates, psm_ses)
-    print(f"\nPSM (Caliper {STUDY_PARAMS['caliper']}): HR={hr:.3f} [{lb:.3f}, {ub:.3f}]")
+    # Pooled PSM
+    if psm_estimates:
+        hr, lb, ub = RubinsRules.pool_estimates(psm_estimates, psm_ses)
+        print(f"\nPSM (Caliper {STUDY_PARAMS['caliper']}): HR={hr:.3f} [{lb:.3f}, {ub:.3f}]")
+    else:
+        print(f"\nPSM Failed.")
     
+    # Pooled IPTW
     print("\nStabilized IPTW Results:")
     print(f"{'Trim':<10} {'HR':<10} {'95% CI':<20}")
     for trim in STUDY_PARAMS['trimming_thresholds']:
@@ -344,6 +325,7 @@ def main():
             hr, lb, ub = RubinsRules.pool_estimates(coefs, ses)
             print(f"{trim:<10} {hr:.3f}      [{lb:.3f}, {ub:.3f}]")
             
+    # Pooled TMLE
     print("\nCV-TMLE Results (Risk Ratio):")
     print(f"{'Trim':<10} {'RR':<10} {'95% CI':<20}")
     for trim in STUDY_PARAMS['trimming_thresholds']:
